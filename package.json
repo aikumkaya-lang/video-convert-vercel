@@ -1,7 +1,7 @@
 {
   "name": "video-convert-vercel",
   "version": "1.0.0",
-  "private": true,
+  "type": "module",
   "dependencies": {
     "busboy": "^1.6.0",
     "ffmpeg-static": "^5.2.0"
