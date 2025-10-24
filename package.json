@@ -1,9 +1,8 @@
 {
-  "name": "video-convert-vercel",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "busboy": "^1.6.0",
-    "ffmpeg-static": "^5.2.0"
+  "functions": {
+    "api/convert.js": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
   }
 }
