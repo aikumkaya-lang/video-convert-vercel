@@ -1,60 +1,92 @@
-// Vercel Node.js Serverless Function (CommonJS)
-const { execFile } = require("node:child_process");
-const { pipeline } = require("node:stream/promises");
-const fs = require("node:fs");
-const path = require("node:path");
-const ffmpegPath = require("ffmpeg-static");
-const Busboy = require("busboy");
+import Busboy from "busboy";
+import os from "os";
+import fs from "fs";
+import path from "path";
+import { spawn } from "child_process";
+import ffmpegPath from "ffmpeg-static";
 
-module.exports = async (req, res) => {
+export const config = {
+  api: {
+    bodyParser: false, // multipart'ı Busboy ile kendimiz okuyacağız
+  },
+};
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Only POST" });
+    return;
+  }
+  if (!ffmpegPath) {
+    res.status(500).json({ error: "ffmpeg binary not found" });
+    return;
+  }
+
   try {
-    if (req.method !== "POST") {
-      res.statusCode = 405;
-      return res.end("Only POST");
-    }
+    const tmpDir = os.tmpdir();
+    const inFile = path.join(tmpDir, `in_${Date.now()}.bin`);
+    const outFile = path.join(tmpDir, `out_${Date.now()}.mp4`);
 
-    const tmpDir = "/tmp";
-    const inPath = path.join(tmpDir, "in.mp4");
-    const outPath = path.join(tmpDir, "out.mp4");
+    const busboy = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 300 * 1024 * 1024 } }); // 300MB üstünü kes
 
-    const bb = Busboy({ headers: req.headers });
-    const fileWrite = fs.createWriteStream(inPath);
-
-    const done = new Promise((resolve, reject) => {
-      let gotFile = false;
-      bb.on("file", (name, file) => {
+    let gotFile = false;
+    const fileWriteDone = new Promise((resolve, reject) => {
+      busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
+        if (fieldname !== "file") {
+          file.resume(); // sadece "file" alanını işliyoruz
+          return;
+        }
         gotFile = true;
-        pipeline(file, fileWrite).then(resolve).catch(reject);
+        const writeStream = fs.createWriteStream(inFile);
+        file.pipe(writeStream);
+        writeStream.on("finish", resolve);
+        writeStream.on("error", reject);
       });
-      bb.on("finish", () => (!gotFile ? reject(new Error("No file field")) : null));
-      bb.on("error", reject);
+      busboy.on("error", reject);
+      busboy.on("finish", () => {
+        if (!gotFile) reject(new Error("No file field"));
+      });
     });
 
-    req.pipe(bb);
-    await done;
+    req.pipe(busboy);
+    await fileWriteDone;
+
+    // ffmpeg filtresi: uzun kenarı 1280'e sabitle, AR koru; 30 fps; yuv420p; çift piksel pad
+    // (Telegram önizleme/uyumluluk için güvenli)
+    const vf =
+      "scale='if(gte(iw,ih),1280,-2)':'if(gte(iw,ih),-2,1280)',fps=30,format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2";
 
     const args = [
-      "-y", "-i", inPath,
-      "-vf",
-      "scale=w='min(1280,iw)':h=-2:flags=fast_bilinear,scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,pad=1280:720:(1280-iw)/2:(720-ih)/2:black",
-      "-c:v","libx264","-profile:v","main","-level","4.1","-pix_fmt","yuv420p",
-      "-r","30","-preset","veryfast","-crf","23",
-      "-c:a","aac","-b:a","128k",
-      "-movflags","+faststart",
-      outPath
+      "-y",
+      "-i", inFile,
+      "-c:v", "libx264",
+      "-preset", "medium",
+      "-crf", "22",
+      "-pix_fmt", "yuv420p",
+      "-vf", vf,
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-movflags", "+faststart",
+      outFile,
     ];
 
     await new Promise((resolve, reject) => {
-      execFile(ffmpegPath, args, (err) => (err ? reject(err) : resolve()));
+      const p = spawn(ffmpegPath, args);
+      let stderr = "";
+      p.stderr.on("data", (d) => (stderr += d.toString()));
+      p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(stderr))));
     });
 
+    // Yanıtı MP4 olarak stream edelim
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Content-Disposition", 'inline; filename="video.mp4"');
-    fs.createReadStream(outPath).pipe(res);
-  } catch (e) {
-    res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ ok:false, error:String(e) }));
+    const rs = fs.createReadStream(outFile);
+    rs.on("close", () => {
+      // temp dosyaları sil
+      [inFile, outFile].forEach((f) => fs.existsSync(f) && fs.unlink(f, () => {}));
+    });
+    rs.pipe(res);
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: String(err?.message || err) });
   }
-};
+}
