@@ -7,9 +7,9 @@ import ffmpegPath from "ffmpeg-static";
 import http from "http";
 import https from "https";
 
-export const config = { api: { bodyParser: false } }; // Next.js Pages API (Vercel) için
+export const config = { api: { bodyParser: false } }; // Vercel/Next Pages API
 
-// --------- Yardımcılar ---------
+// ---------- Yardımcılar ----------
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST,OPTIONS",
@@ -20,19 +20,29 @@ function sendCORS(res) {
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
 }
 
-function bad(res, code, msg, meta = {}) {
-  sendCORS(res);
-  res.statusCode = code;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify({ ok: false, error: msg, ...meta }));
+function jsonError(res, code, msg, extra = {}) {
+  try {
+    if (!res.headersSent) {
+      sendCORS(res);
+      res.statusCode = code;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ ok: false, error: msg, ...extra }));
+    } else {
+      res.end(); // headers zaten gitmişse, sessizce kapat
+    }
+  } catch {}
 }
 
 function sanitizeFilename(name = "video.mp4") {
   return String(name).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 64) || "video.mp4";
 }
 
+function cleanUrl(u = "") {
+  return String(u).replace(/\s+/g, " ").trim();
+}
+
 function googleDriveDirect(u) {
-  // https://drive.google.com/file/d/FILEID/view?usp=...  ->  https://drive.google.com/uc?export=download&id=FILEID
+  // https://drive.google.com/file/d/FILEID/view?...  →  https://drive.google.com/uc?export=download&id=FILEID
   try {
     const m = String(u).match(/\/file\/d\/([^/]+)/);
     if (m && m[1]) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
@@ -40,7 +50,7 @@ function googleDriveDirect(u) {
   return u;
 }
 
-function fetchHead(url) {
+function doHead(url) {
   return new Promise((resolve, reject) => {
     try {
       const lib = url.startsWith("https") ? https : http;
@@ -53,45 +63,45 @@ function fetchHead(url) {
   });
 }
 
-function ffmpeg(args, stdinStream, stdoutStream) {
+// ffmpeg çalıştır + stdout'u opsiyonel stream et
+function runFfmpeg(args, stdoutStream) {
   return new Promise((resolve, reject) => {
-    const p = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
-
-    if (stdinStream) stdinStream.pipe(p.stdin);
-    else p.stdin.end();
+    const p = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderrBuf = "";
 
     if (stdoutStream) p.stdout.pipe(stdoutStream);
     else p.stdout.resume();
 
-    let stderrBuf = "";
     p.stderr.on("data", (d) => { stderrBuf += d.toString(); });
 
     p.on("close", (code) => {
       if (code === 0) return resolve({ ok: true, log: stderrBuf });
-      return reject(Object.assign(new Error("ffmpeg exit code " + code), { log: stderrBuf }));
+      const err = new Error("ffmpeg exit code " + code);
+      err.log = stderrBuf;
+      return reject(err);
     });
   });
 }
 
-// --------- İstekten URL/FILE alma ---------
+// ---------- İstekten girdi alma ----------
 async function parseInput(req) {
   return new Promise((resolve, reject) => {
     const contentType = req.headers["content-type"] || "";
 
-    // JSON/body raw POST (opsiyonel destek: { url, profile, mode, filename })
+    // JSON body { url, profile, mode, filename }
     if (contentType.includes("application/json")) {
       let raw = "";
       req.on("data", (c) => (raw += c.toString()));
       req.on("end", () => {
         try {
           const j = JSON.parse(raw || "{}");
-          return resolve({
+          resolve({
             url: j.url || "",
             profile: j.profile || "",
             mode: j.mode || "",
             filename: j.filename || ""
           });
-        } catch (e) { return reject(e); }
+        } catch (e) { reject(e); }
       });
       return;
     }
@@ -141,119 +151,154 @@ async function parseInput(req) {
       return;
     }
 
-    // desteklenmeyen tip
-    resolve({});
+    resolve({}); // desteklenmeyen tip → boş
   });
 }
 
-// --------- Ana handler ---------
+// ---------- Ana handler ----------
 export default async function handler(req, res) {
   sendCORS(res);
   if (req.method === "OPTIONS") { res.statusCode = 204; return res.end(); }
-  if (req.method !== "POST") return bad(res, 405, "Only POST supported");
+  if (req.method !== "POST") return jsonError(res, 405, "Only POST supported");
 
-  if (!ffmpegPath) return bad(res, 500, "ffmpeg binary not found");
+  if (!ffmpegPath) return jsonError(res, 500, "ffmpeg binary not found");
 
   let input = {};
   try { input = await parseInput(req); }
-  catch (e) { return bad(res, 400, "Bad request body", { detail: String(e) }); }
+  catch (e) { return jsonError(res, 400, "bad_request_body", { detail: String(e) }); }
 
   let { url = "", profile = "", mode = "", filename = "", filePath = "", fileMime = "" } = input;
-  url = (url || "").trim();
-  if (url) url = googleDriveDirect(url);
 
-  // Basit doğrulama
-  if (!url && !filePath) return bad(res, 400, "Provide either 'url' or 'file'");
+  url = cleanUrl(url);
+  if (url.includes("drive.google.com")) url = googleDriveDirect(url);
 
-  // Çıktı başlıkları
-  const outName = sanitizeFilename(filename || (url ? (new URL(url).pathname.split("/").pop() || "video.mp4") : "video.mp4"));
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Content-Disposition", `inline; filename="${outName.replace(/"/g, "")}"`);
+  if (!url && !filePath) {
+    return jsonError(res, 400, "missing_input", { hint: "Provide either 'url' or 'file'." });
+  }
 
-  // --- Girdi kaynağını belirle: ffmpeg -i <URL> kullanmak genelde daha stabil ---
-  // Eğer file yüklendiyse yerelden oku; URL varsa doğrudan URL ver (ffmpeg kendi indirir).
+  // (İsteğe bağlı) Drive'da indirme yerine HTML dönebilir; HEAD ile hızlı kontrol
+  if (url) {
+    try {
+      const head = await doHead(url);
+      const ctype = String(head.headers?.["content-type"] || "");
+      // Google Drive 'text/html' dönerse ffmpeg -i URL yine çoğu zaman indirir; ama bilinçli uyarı olsun
+      if (ctype.includes("text/html") && url.includes("drive.google.com")) {
+        // yine de deneyeceğiz; sadece meta bilgi olarak iletelim
+      }
+    } catch {}
+  }
+
+  const outName = sanitizeFilename(
+    filename ||
+    (url ? (new URL(url).pathname.split("/").pop() || "video.mp4") : "video.mp4")
+  );
   const inputSpec = filePath ? filePath : url;
 
-  // --- Profil/Mod seçimi ---
   const wantTelegram = String(profile).toLowerCase() === "telegram";
   const wantCopyfix  = String(mode).toLowerCase() === "copyfix";
 
-  // ffmpeg argümanları (ortak)
-  const commonIO = ["-hide_banner", "-i", inputSpec, "-map", "0:v:0", "-map", "0:a:?", "-movflags", "+faststart", "-f", "mp4", "pipe:1"];
-
-  // 1) copyfix (çok hızlı) → rotate=0 + SAR=1:1, re-encode yok
-  const copyfixArgs = [
-    ...commonIO.slice(0, 4),
-    ...commonIO.slice(4) // sadece dizilimi net tutmak için
+  // ffmpeg args
+  const commonEncArgs = [
+    "-hide_banner", "-y",
+    "-i", inputSpec,
+    "-map", "0:v:0", "-map", "0:a:?",
+    "-movflags", "+faststart",
+    "-f", "mp4", "pipe:1"
   ];
-  // copy paramlarını araya yerleştir
-  copyfixArgs.splice(4, 0, "-c", "copy", "-metadata:s:v:0", "rotate=0");
-  // codec'e göre bsf
-  // not: ffmpeg dosyanın codec'ine uygun bsf'yi görmezse hata vermez; yine de iki bsf denemesi gerekebilir.
-  const copyfixArgsH264 = [...copyfixArgs];
-  copyfixArgsH264.splice(6, 0, "-bsf:v", "h264_metadata=sample_aspect_ratio=1/1");
-  const copyfixArgsHEVC = [...copyfixArgs];
-  copyfixArgsHEVC.splice(6, 0, "-bsf:v", "hevc_metadata=sample_aspect_ratio=1/1");
 
-  // 2) encode fallback (telegram profili)
-  const encArgs = [
-    "-hide_banner", "-i", inputSpec,
+  // 1) copyfix: yeniden kodlama YOK → rotate=0 + SAR=1:1
+  const copyfixH264 = [
+    "-hide_banner", "-y",
+    "-i", inputSpec,
+    "-map", "0:v:0", "-map", "0:a:?",
+    "-c", "copy",
+    "-metadata:s:v:0", "rotate=0",
+    "-bsf:v", "h264_metadata=sample_aspect_ratio=1/1",
+    "-movflags", "+faststart",
+    "-f", "mp4", "pipe:1"
+  ];
+  const copyfixHEVC = [
+    "-hide_banner", "-y",
+    "-i", inputSpec,
+    "-map", "0:v:0", "-map", "0:a:?",
+    "-c", "copy",
+    "-metadata:s:v:0", "rotate=0",
+    "-bsf:v", "hevc_metadata=sample_aspect_ratio=1/1",
+    "-movflags", "+faststart",
+    "-f", "mp4", "pipe:1"
+  ];
+
+  // 2) encode fallback: Telegram uyumlu profil (stabil)
+  const encTelegram = [
+    "-hide_banner", "-y",
+    "-i", inputSpec,
     "-map", "0:v:0", "-map", "0:a:?",
     "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
     "-r", "30", "-g", "60",
-    "-vf", wantTelegram ? "setsar=1" : "setsar=1",
+    "-vf", "setsar=1",
     "-c:a", "aac", "-b:a", "128k", "-ac", "2",
     "-movflags", "+faststart",
     "-f", "mp4", "pipe:1"
   ];
 
-  // --- Yürütme stratejisi ---
+  // ---- Çıkış başlıklarını ilk chunk'ta set et (0B/200 hatasını engeller) ----
+  let headersSent = false;
+  function ensureHeaders() {
+    if (!headersSent) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `inline; filename="${outName.replace(/"/g, "")}"`);
+      sendCORS(res);
+      headersSent = true;
+    }
+  }
+
+  // stdout'u res'e pipe ederken ilk chunk'ta header gönder
+  const passthrough = new (require("stream").PassThrough)();
+  passthrough.on("data", (chunk) => {
+    ensureHeaders();
+    res.write(chunk);
+  });
+  passthrough.on("end", () => {
+    try { res.end(); } catch {}
+  });
+
+  // ---- Yürütme stratejisi ----
   try {
     if (wantCopyfix) {
-      // Önce H.264 copyfix dene
+      // H.264 copyfix dene
       try {
-        await ffmpeg(copyfixArgsH264, null, res);
-        cleanup();
-        return;
+        await runFfmpeg(copyfixH264, passthrough);
+        return; // başarılı
       } catch (e1) {
         // HEVC copyfix dene
         try {
-          await ffmpeg(copyfixArgsHEVC, null, res);
-          cleanup();
+          await runFfmpeg(copyfixHEVC, passthrough);
           return;
         } catch (e2) {
-          // düş → encode
+          // düş → encode'a geç
         }
       }
     }
 
-    // Eğer profile=telegram ise direkt encode (stabil)
+    // profile=telegram → doğrudan encode (stabil, her kaynakta aynı görünüm)
     if (wantTelegram || !wantCopyfix) {
-      await ffmpeg(encArgs, null, res);
-      cleanup();
+      await runFfmpeg(encTelegram, passthrough);
       return;
     }
 
-    // default: copyfix → encode (zaten yukarıda denedik); buraya düşmez ama güvenlik için
-    await ffmpeg(encArgs, null, res);
-    cleanup();
+    // Güvenlik için default (buraya normalde düşmez)
+    await runFfmpeg(encTelegram, passthrough);
     return;
 
   } catch (err) {
-    // Stream headerları çoktan gönderildiyse bir şey yapamayız; ama çoğu zaman buraya gelmeden önce set edilmiştir.
-    try {
-      // Eğer henüz yanıt kapanmadıysa JSON hata gönder
-      if (!res.headersSent) bad(res, 500, "convert_failed", { detail: err?.log || String(err) });
-      else res.end();
-    } catch {}
-  } finally {
-    cleanup();
-  }
-
-  function cleanup() {
-    if (filePath) {
-      try { fs.unlinkSync(filePath); } catch {}
+    // ffmpeg hata verdiyse ve hiç veri çıkmadıysa JSON hata dön
+    if (!headersSent) {
+      return jsonError(res, 502, "convert_failed", { detail: (err?.log || String(err)).slice(0, 800) });
     }
+    try { res.end(); } catch {}
+  } finally {
+    // temp dosyayı sil
+    if (filePath) { try { fs.unlinkSync(filePath); } catch {} }
   }
 }
