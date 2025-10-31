@@ -4,166 +4,256 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
+import http from "http";
+import https from "https";
 
-// ---- helpers ----
-function setCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, *");
-  res.setHeader("Access-Control-Max-Age", "86400");
+export const config = { api: { bodyParser: false } }; // Next.js Pages API (Vercel) için
+
+// --------- Yardımcılar ---------
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Accept"
+};
+
+function sendCORS(res) {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
 }
 
-async function downloadFollowRedirects(url, outPath, maxRedirects = 5) {
-  const doFetch = async (u, depth = 0) => {
-    if (depth > maxRedirects) throw new Error("too_many_redirects");
-    const mod = u.startsWith("https:") ? await import("https") : await import("http");
-    await new Promise((resolve, reject) => {
-      const req = mod.get(u, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          "Accept": "*/*",
-          "Accept-Language": "en-US,en;q=0.9"
-        },
-        timeout: 30000
-      }, (r) => {
-        // Redirect?
-        if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
-          const next = new URL(r.headers.location, u).toString();
-          r.resume();
-          doFetch(next, depth + 1).then(resolve).catch(reject);
-          return;
-        }
-        if (r.statusCode >= 400) {
-          r.resume();
-          return reject(new Error("download_failed_status_" + r.statusCode));
-        }
-        const ct = (r.headers["content-type"] || "").toLowerCase();
-        // Drive onay sayfası vb. HTML geldiyse
-        if (ct.includes("text/html")) {
-          r.resume();
-          return reject(new Error("download_returned_html"));
-        }
-        const ws = fs.createWriteStream(outPath);
-        r.pipe(ws);
-        ws.on("finish", resolve);
-        ws.on("error", reject);
-      });
-      req.on("timeout", () => { req.destroy(new Error("download_timeout")); });
-      req.on("error", reject);
-    });
-  };
-  await doFetch(url, 0);
+function bad(res, code, msg, meta = {}) {
+  sendCORS(res);
+  res.statusCode = code;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify({ ok: false, error: msg, ...meta }));
 }
 
-export const config = { api: { bodyParser: false } };
+function sanitizeFilename(name = "video.mp4") {
+  return String(name).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 64) || "video.mp4";
+}
 
-export default async function handler(req, res) {
-  setCORS(res);
-
-  if (req.method === "OPTIONS") {
-    res.status(204).end(); // CORS preflight
-    return;
-  }
-
-  if (req.method !== "POST") {
-    res.status(200).json({ ok:false, error:"Only POST", v:"PAD16X9-DUALUP-FINAL-2025-10-31" });
-    return;
-  }
-
-  if (!ffmpegPath) {
-    res.status(500).json({ ok:false, error:"ffmpeg binary not found" });
-    return;
-  }
-
-  let remoteUrl = null, gotFile = false;
-  const tmp = os.tmpdir();
-  const inFile  = path.join(tmp, `in_${Date.now()}.bin`);
-  const outFile = path.join(tmp, `out_${Date.now()}.mp4`);
-
+function googleDriveDirect(u) {
+  // https://drive.google.com/file/d/FILEID/view?usp=...  ->  https://drive.google.com/uc?export=download&id=FILEID
   try {
-    // ---- parse form-data (file | url) ----
-    await new Promise((resolve, reject) => {
-      const bb = Busboy({ headers: req.headers, limits: { files: 1 } });
+    const m = String(u).match(/\/file\/d\/([^/]+)/);
+    if (m && m[1]) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+  } catch {}
+  return u;
+}
 
-      bb.on("file", (_name, file) => {
-        gotFile = true;
-        const ws = fs.createWriteStream(inFile);
-        file.pipe(ws);
-        ws.on("finish", resolve);
-        ws.on("error", reject);
+function fetchHead(url) {
+  return new Promise((resolve, reject) => {
+    try {
+      const lib = url.startsWith("https") ? https : http;
+      const req = lib.request(url, { method: "HEAD" }, (res) => {
+        resolve({ status: res.statusCode || 0, headers: res.headers || {} });
       });
+      req.on("error", reject);
+      req.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+function ffmpeg(args, stdinStream, stdoutStream) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+
+    if (stdinStream) stdinStream.pipe(p.stdin);
+    else p.stdin.end();
+
+    if (stdoutStream) p.stdout.pipe(stdoutStream);
+    else p.stdout.resume();
+
+    let stderrBuf = "";
+    p.stderr.on("data", (d) => { stderrBuf += d.toString(); });
+
+    p.on("close", (code) => {
+      if (code === 0) return resolve({ ok: true, log: stderrBuf });
+      return reject(Object.assign(new Error("ffmpeg exit code " + code), { log: stderrBuf }));
+    });
+  });
+}
+
+// --------- İstekten URL/FILE alma ---------
+async function parseInput(req) {
+  return new Promise((resolve, reject) => {
+    const contentType = req.headers["content-type"] || "";
+
+    // JSON/body raw POST (opsiyonel destek: { url, profile, mode, filename })
+    if (contentType.includes("application/json")) {
+      let raw = "";
+      req.on("data", (c) => (raw += c.toString()));
+      req.on("end", () => {
+        try {
+          const j = JSON.parse(raw || "{}");
+          return resolve({
+            url: j.url || "",
+            profile: j.profile || "",
+            mode: j.mode || "",
+            filename: j.filename || ""
+          });
+        } catch (e) { return reject(e); }
+      });
+      return;
+    }
+
+    // multipart/form-data
+    if (contentType.includes("multipart/form-data")) {
+      const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 1024 * 1024 * 1024 } });
+      let url = "", profile = "", mode = "", filename = "";
+      let filePath = "", fileMime = "";
 
       bb.on("field", (name, val) => {
-        if (name === "url") remoteUrl = String(val || "").trim();
+        if (name === "url") url = val;
+        if (name === "profile") profile = val;
+        if (name === "mode") mode = val;
+        if (name === "filename") filename = val;
       });
 
+      bb.on("file", (name, file, info) => {
+        if (name !== "file") { file.resume(); return; }
+        const tmp = path.join(os.tmpdir(), `in_${Date.now()}_${sanitizeFilename(info.filename || "upload.bin")}`);
+        filePath = tmp;
+        fileMime = info.mimeType || "";
+        const ws = fs.createWriteStream(tmp);
+        file.pipe(ws);
+        ws.on("close", () => {});
+      });
+
+      bb.on("close", () => resolve({ url, profile, mode, filename, filePath, fileMime }));
       bb.on("error", reject);
-      bb.on("finish", () => { if (!gotFile && !remoteUrl) resolve(); });
       req.pipe(bb);
-    });
-
-    // ---- Google Drive URL normalizasyonu ----
-    if (!gotFile && remoteUrl && /drive\.google\.com/.test(remoteUrl)) {
-      const m = remoteUrl.match(/[?&]id=([^&]+)/);
-      if (m) {
-        // Public paylaşım şart (Anyone with the link)
-        remoteUrl = `https://drive.usercontent.google.com/download?id=${m[1]}&export=download`;
-      }
-    }
-
-    // ---- URL'den indir ----
-    if (!gotFile && remoteUrl) {
-      await downloadFollowRedirects(remoteUrl, inFile, 5);
-      gotFile = true;
-    }
-
-    if (!gotFile) {
-      res.status(400).json({ ok:false, error:"Missing 'url' or 'file'" });
       return;
     }
 
-    // ---- hızlı boyut kontrolü ----
-    try {
-      const st = fs.statSync(inFile);
-      if (!st.size || st.size < 1024) {
-        res.status(400).json({ ok:false, error:"downloaded_too_small_or_invalid" });
+    // x-www-form-urlencoded
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      let raw = "";
+      req.on("data", (c) => (raw += c.toString()));
+      req.on("end", () => {
+        const params = new URLSearchParams(raw);
+        resolve({
+          url: params.get("url") || "",
+          profile: params.get("profile") || "",
+          mode: params.get("mode") || "",
+          filename: params.get("filename") || ""
+        });
+      });
+      return;
+    }
+
+    // desteklenmeyen tip
+    resolve({});
+  });
+}
+
+// --------- Ana handler ---------
+export default async function handler(req, res) {
+  sendCORS(res);
+  if (req.method === "OPTIONS") { res.statusCode = 204; return res.end(); }
+  if (req.method !== "POST") return bad(res, 405, "Only POST supported");
+
+  if (!ffmpegPath) return bad(res, 500, "ffmpeg binary not found");
+
+  let input = {};
+  try { input = await parseInput(req); }
+  catch (e) { return bad(res, 400, "Bad request body", { detail: String(e) }); }
+
+  let { url = "", profile = "", mode = "", filename = "", filePath = "", fileMime = "" } = input;
+  url = (url || "").trim();
+  if (url) url = googleDriveDirect(url);
+
+  // Basit doğrulama
+  if (!url && !filePath) return bad(res, 400, "Provide either 'url' or 'file'");
+
+  // Çıktı başlıkları
+  const outName = sanitizeFilename(filename || (url ? (new URL(url).pathname.split("/").pop() || "video.mp4") : "video.mp4"));
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `inline; filename="${outName.replace(/"/g, "")}"`);
+
+  // --- Girdi kaynağını belirle: ffmpeg -i <URL> kullanmak genelde daha stabil ---
+  // Eğer file yüklendiyse yerelden oku; URL varsa doğrudan URL ver (ffmpeg kendi indirir).
+  const inputSpec = filePath ? filePath : url;
+
+  // --- Profil/Mod seçimi ---
+  const wantTelegram = String(profile).toLowerCase() === "telegram";
+  const wantCopyfix  = String(mode).toLowerCase() === "copyfix";
+
+  // ffmpeg argümanları (ortak)
+  const commonIO = ["-hide_banner", "-i", inputSpec, "-map", "0:v:0", "-map", "0:a:?", "-movflags", "+faststart", "-f", "mp4", "pipe:1"];
+
+  // 1) copyfix (çok hızlı) → rotate=0 + SAR=1:1, re-encode yok
+  const copyfixArgs = [
+    ...commonIO.slice(0, 4),
+    ...commonIO.slice(4) // sadece dizilimi net tutmak için
+  ];
+  // copy paramlarını araya yerleştir
+  copyfixArgs.splice(4, 0, "-c", "copy", "-metadata:s:v:0", "rotate=0");
+  // codec'e göre bsf
+  // not: ffmpeg dosyanın codec'ine uygun bsf'yi görmezse hata vermez; yine de iki bsf denemesi gerekebilir.
+  const copyfixArgsH264 = [...copyfixArgs];
+  copyfixArgsH264.splice(6, 0, "-bsf:v", "h264_metadata=sample_aspect_ratio=1/1");
+  const copyfixArgsHEVC = [...copyfixArgs];
+  copyfixArgsHEVC.splice(6, 0, "-bsf:v", "hevc_metadata=sample_aspect_ratio=1/1");
+
+  // 2) encode fallback (telegram profili)
+  const encArgs = [
+    "-hide_banner", "-i", inputSpec,
+    "-map", "0:v:0", "-map", "0:a:?",
+    "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
+    "-r", "30", "-g", "60",
+    "-vf", wantTelegram ? "setsar=1" : "setsar=1",
+    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+    "-movflags", "+faststart",
+    "-f", "mp4", "pipe:1"
+  ];
+
+  // --- Yürütme stratejisi ---
+  try {
+    if (wantCopyfix) {
+      // Önce H.264 copyfix dene
+      try {
+        await ffmpeg(copyfixArgsH264, null, res);
+        cleanup();
         return;
+      } catch (e1) {
+        // HEVC copyfix dene
+        try {
+          await ffmpeg(copyfixArgsHEVC, null, res);
+          cleanup();
+          return;
+        } catch (e2) {
+          // düş → encode
+        }
       }
-    } catch {
-      res.status(400).json({ ok:false, error:"download_stat_failed" });
+    }
+
+    // Eğer profile=telegram ise direkt encode (stabil)
+    if (wantTelegram || !wantCopyfix) {
+      await ffmpeg(encArgs, null, res);
+      cleanup();
       return;
     }
 
-    // ---- ffmpeg → mp4 (Telegram uyumlu) ----
-    const args = [
-      "-y", "-i", inFile,
-      "-movflags", "faststart",
-      "-vcodec", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-      "-acodec", "aac", "-b:a", "128k",
-      "-vf", "scale='min(1280,iw)':-2",
-      outFile
-    ];
-    await new Promise((resolve, reject) => {
-      const p = spawn(ffmpegPath, args);
-      p.on("error", reject);
-      p.on("close", code => code === 0 ? resolve() : reject(new Error("ffmpeg_failed")));
-    });
+    // default: copyfix → encode (zaten yukarıda denedik); buraya düşmez ama güvenlik için
+    await ffmpeg(encArgs, null, res);
+    cleanup();
+    return;
 
-    // ---- dosyayı indirttir ----
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Content-Disposition", 'attachment; filename="converted.mp4"');
-    setCORS(res);
+  } catch (err) {
+    // Stream headerları çoktan gönderildiyse bir şey yapamayız; ama çoğu zaman buraya gelmeden önce set edilmiştir.
+    try {
+      // Eğer henüz yanıt kapanmadıysa JSON hata gönder
+      if (!res.headersSent) bad(res, 500, "convert_failed", { detail: err?.log || String(err) });
+      else res.end();
+    } catch {}
+  } finally {
+    cleanup();
+  }
 
-    fs.createReadStream(outFile)
-      .on("close", () => { try { fs.unlinkSync(inFile); fs.unlinkSync(outFile); } catch {} })
-      .pipe(res);
-
-  } catch (e) {
-    try { fs.unlinkSync(inFile); } catch {}
-    try { fs.unlinkSync(outFile); } catch {}
-    const msg = (e && e.message) ? e.message : String(e);
-    setCORS(res);
-    res.status(500).json({ ok:false, error: msg });
+  function cleanup() {
+    if (filePath) {
+      try { fs.unlinkSync(filePath); } catch {}
+    }
   }
 }
