@@ -1,7 +1,4 @@
 import Busboy from "busboy";
-import fs from "fs";
-import os from "os";
-import path from "path";
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import https from "https";
@@ -11,19 +8,13 @@ export const config = { api: { bodyParser: false } };
 
 export default async function handler(req, res) {
   if (req.method !== "POST")
-    return res.status(405).json({ error: "Only POST allowed" });
-
-  if (!ffmpegPath)
-    return res.status(500).json({ error: "ffmpeg binary not found" });
-
-  const tmp = os.tmpdir();
-  const inFile = path.join(tmp, `in_${Date.now()}.mp4`);
-  const outFile = path.join(tmp, `out_${Date.now()}.mp4`);
+    return res.status(405).json({ error: "Only POST requests allowed" });
 
   let inputUrl = null;
   let profile = "telegram";
   let mode = "copyfix";
 
+  // ✅ Form verisini al
   await new Promise((resolve, reject) => {
     const bb = Busboy({ headers: req.headers });
     bb.on("field", (name, val) => {
@@ -35,60 +26,52 @@ export default async function handler(req, res) {
     req.pipe(bb);
   });
 
-  if (!inputUrl) return res.status(400).json({ error: "missing_input" });
+  if (!inputUrl) return res.status(400).json({ error: "missing_url" });
 
   const lib = inputUrl.startsWith("https:") ? https : http;
 
-  await new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(inFile);
-    lib.get(inputUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, (r) => {
-      if (r.statusCode !== 200)
-        return reject(new Error(`download_failed_${r.statusCode}`));
-      r.pipe(file);
-      file.on("finish", () => file.close(resolve));
-    }).on("error", reject);
-  });
-
-  const args = [
-    "-y",
-    "-i",
-    inFile,
-    "-movflags",
-    "faststart",
-    "-pix_fmt",
-    "yuv420p",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    outFile,
-  ];
-
-  await new Promise((resolve, reject) => {
-    const ff = spawn(ffmpegPath, args);
-    ff.stderr.on("data", (d) => console.log("ffmpeg:", d.toString()));
-    ff.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg_failed_${code}`));
-    });
-  });
-
   try {
-    const stats = fs.statSync(outFile);
+    // ✅ ffmpeg'i stream üzerinden çalıştır (disk kullanmadan)
+    const ff = spawn(ffmpegPath, [
+      "-i", "pipe:0",
+      "-movflags", "faststart",
+      "-pix_fmt", "yuv420p",
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-f", "mp4",
+      "pipe:1"
+    ]);
+
+    // ✅ ffmpeg çıktısını doğrudan response’a aktar
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stats.size);
-    const stream = fs.createReadStream(outFile);
-    stream.pipe(res);
-    stream.on("close", () => {
-      fs.unlinkSync(inFile);
-      fs.unlinkSync(outFile);
+
+    ff.stdout.pipe(res);
+
+    // ✅ Input stream
+    lib.get(inputUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, (r) => {
+      if (r.statusCode !== 200) {
+        res.status(400).json({ error: `download_failed_${r.statusCode}` });
+        ff.kill("SIGKILL");
+        return;
+      }
+      r.pipe(ff.stdin);
+    });
+
+    ff.on("error", (err) => {
+      console.error("FFMPEG error:", err);
+      if (!res.headersSent)
+        res.status(500).json({ error: "ffmpeg_error" });
+    });
+
+    ff.on("exit", (code) => {
+      if (code !== 0)
+        console.log(`ffmpeg exited with code ${code}`);
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "convert_failed" });
+    console.error("convert_failed", err);
+    if (!res.headersSent)
+      res.status(500).json({ error: "convert_failed" });
   }
 }
