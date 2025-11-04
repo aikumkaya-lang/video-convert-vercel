@@ -1,4 +1,6 @@
-// api/convert.js — autorotate + robust multicrop + decide AFTER crop (force 9:16 / 16:9)
+// api/convert.js — autorotate + multicrop + parametric AR (fills tall phones)
+// Params: h, preset, maxrate, ar=WxH (e.g. 9:19.5 or 16:9), overscan=1.00..1.10
+
 import { spawn } from "node:child_process";
 import { pipeline, Readable } from "node:stream";
 import { createWriteStream, promises as fsp } from "node:fs";
@@ -54,10 +56,26 @@ async function urlToTmpFile(urlRaw,hint="in"){
   return { file, disp: r.headers.get("content-disposition")||"" };
 }
 
-// --- helpers ---
-const vfCover16x9 = (H)=>{ const W=Math.round(H*16/9); return `scale=trunc(iw*max(${H}/ih\\,${W}/iw)/2)*2:trunc(ih*max(${H}/ih\\,${W}/iw)/2)*2,crop=${W}:${H}`; };
-const vfCover9x16  = (H)=>{ const W=Math.round(H*9/16);  return `scale=trunc(iw*max(${H}/ih\\,${W}/iw)/2)*2:trunc(ih*max(${H}/ih\\,${W}/iw)/2)*2,crop=${W}:${H}`; };
+// ---------- helpers ----------
+const even = (n)=> n - (n % 2);
 
+function parseAR(arStr, isPortrait){
+  // ar can be "9:16", "9:19.5", "16:9", "20:9" etc.
+  if(!arStr || !/^\d+(\.\d+)?:\d+(\.\d+)?$/.test(arStr)){
+    return isPortrait ? {tw:9, th:16} : {tw:16, th:9}; // default
+  }
+  const [a,b] = arStr.split(":").map(parseFloat);
+  return { tw:a, th:b };
+}
+
+function vfCoverTo(H, targetW){
+  // Scale to cover then crop exact WxH
+  const W = even(Math.round(targetW));
+  const H2 = even(H);
+  return `scale=trunc(iw*max(${H2}/ih\\,${W}/iw)/2)*2:trunc(ih*max(${H2}/ih\\,${W}/iw)/2)*2,crop=${W}:${H2}`;
+}
+
+// ffmpeg -i meta
 async function probeMeta(inPath){
   return new Promise((resolve)=>{
     let out=""; const ff=spawn(ffmpegPath,["-hide_banner","-i",inPath],{stdio:["ignore","ignore","pipe"]});
@@ -72,40 +90,37 @@ async function probeMeta(inPath){
       let dispW=Math.round(w*(sarNum/sarDen)), dispH=h;
       if(dar){ const dNum=parseInt(dar[1],10)||16, dDen=parseInt(dar[2],10)||9; dispW=Math.round(dNum*(dispH/dDen)); }
       const rotate=rot?((parseInt(rot[1],10)%360+360)%360):0;
-      resolve({ w,h,dispW,dispH,rotate });
+      resolve({ dispW, dispH, rotate });
     });
   });
 }
 
-// Çok noktalı/çok eşikli cropdetect: çoğunluğu al, mod2’ye yuvarla
+// multi-cropdetect (çoğunluk)
 async function detectCropMulti(inPath, pre=null){
-  const ssList=[1,3,5]; // saniye
-  const limits=[40,32,24]; // daha agresiften daha gevşeğe
+  const ssList=[1,3,5]; const limits=[40,32,24];
   const results=[];
   for(const ss of ssList){
     for(const lim of limits){
       const vf = pre ? `${pre},cropdetect=${lim}:16:0` : `cropdetect=${lim}:16:0`;
       const args=["-hide_banner","-loglevel","info","-ss",String(ss),"-t","3","-i",inPath,"-vf",vf,"-f","null","-"];
-      let out=""; await new Promise((res)=>{ const ff=spawn(ffmpegPath,args,{stdio:["ignore","ignore","pipe"]});
-        ff.stderr.on("data",(d)=>out+=d.toString()); ff.on("close",()=>res()); });
+      let out=""; await new Promise((res)=>{ const ff=spawn(ffmpegPath,args,{stdio:["ignore","ignore","pipe"]}); ff.stderr.on("data",(d)=>out+=d.toString()); ff.on("close",()=>res()); });
       const matches=[...out.matchAll(/crop=\s*(\d+):(\d+):(\d+):(\d+)/g)];
       if(matches.length){
         const m=matches[matches.length-1];
         let W=parseInt(m[1],10), H=parseInt(m[2],10), X=parseInt(m[3],10), Y=parseInt(m[4],10);
-        // genelde 2'ye bölünebilir olsun
-        W-=W%2; H-=H%2; X-=X%2; Y-=Y%2;
+        W=even(W); H=even(H); X=even(X); Y=even(Y);
         if(W>=200 && H>=200) results.push(`${W}:${H}:${X}:${Y}`);
       }
     }
   }
   if(!results.length) return null;
-  // çoğunluğu (mode) seç
   const cnt=new Map(); for(const r of results) cnt.set(r,(cnt.get(r)||0)+1);
   let best=results[0], bestN=0; for(const [k,v] of cnt.entries()){ if(v>bestN){ best=k; bestN=v; } }
   const [W,H,X,Y]=best.split(":").map(n=>parseInt(n,10));
   return `crop=${W}:${H}:${X}:${Y}`;
 }
 
+// ffmpeg runners
 function ffArgsEncode(inPath,outPath,vf,preset,maxrate){
   return ["-hide_banner","-loglevel","error","-y","-i",inPath,"-max_muxing_queue_size","9999","-vf",vf,
     "-c:v","libx264","-preset",preset,"-crf","23","-maxrate",maxrate,
@@ -117,13 +132,11 @@ function ffArgsCopyfix(inPath,outPath){
 }
 async function runEncode(inPath,outPath,vf,preset,maxrate){
   if(!ffmpegPath) throw new Error("ffmpeg binary not found");
-  return new Promise((res,rej)=>{ let err=""; const ff=spawn(ffmpegPath,ffArgsEncode(inPath,outPath,vf,preset,maxrate),{stdio:["ignore","ignore","pipe"]});
-    ff.stderr.on("data",(d)=>err+=d.toString()); ff.on("close",(c)=>c===0?res():rej(new Error(err||`ffmpeg exited ${c}`))); });
+  return new Promise((res,rej)=>{ let err=""; const ff=spawn(ffmpegPath,ffArgsEncode(inPath,outPath,vf,preset,maxrate),{stdio:["ignore","ignore","pipe"]}); ff.stderr.on("data",(d)=>err+=d.toString()); ff.on("close",(c)=>c===0?res():rej(new Error(err||`ffmpeg exited ${c}`))); });
 }
 async function runCopyfix(inPath,outPath){
   if(!ffmpegPath) throw new Error("ffmpeg binary not found");
-  return new Promise((res,rej)=>{ let err=""; const ff=spawn(ffmpegPath,ffArgsCopyfix(inPath,outPath),{stdio:["ignore","ignore","pipe"]});
-    ff.stderr.on("data",(d)=>err+=d.toString()); ff.on("close",(c)=>c===0?res():rej(new Error(err||`ffmpeg exited ${c}`))); });
+  return new Promise((res,rej)=>{ let err=""; const ff=spawn(ffmpegPath,ffArgsCopyfix(inPath,outPath),{stdio:["ignore","ignore","pipe"]}); ff.stderr.on("data",(d)=>err+=d.toString()); ff.on("close",(c)=>c===0?res():rej(new Error(err||`ffmpeg exited ${c}`))); });
 }
 async function exists(p){ try{ await fsp.access(p); return true;}catch{ return false; } }
 
@@ -135,9 +148,10 @@ export default async function handler(req,res){
 
     const u2=new URL(req.url,"http://x");
     const H=parseInt(u2.searchParams.get("h")||"1080",10);
-    const mode=(u2.searchParams.get("mode")||"encode").toLowerCase();
     const preset=(u2.searchParams.get("preset")||"faster").toLowerCase();
     const maxrate=(u2.searchParams.get("maxrate")||"4500k").toLowerCase();
+    const arParam=(u2.searchParams.get("ar")||"").toLowerCase();
+    const overscan=Math.min(Math.max(parseFloat(u2.searchParams.get("overscan")||"1.00"),1.00),1.10);
 
     const { url:urlRaw, fileStream, filename:inName } = await getInputFromRequest(req);
     let src=inName||"video";
@@ -152,36 +166,34 @@ export default async function handler(req,res){
     const makeOut=()=>join(tmpdir(),`out_${Date.now()}_${rnd(4)}.mp4`);
     outFile=makeOut();
 
-    if(mode==="copyfix"){
-      try{ await runCopyfix(inFile,outFile); }
-      catch{ await fsp.unlink(outFile).catch(()=>{}); outFile=makeOut(); }
-    }
+    // 1) meta (rotate + visible AR)
+    const { dispW, dispH, rotate } = await probeMeta(inFile);
+    const pre = (rotate===90) ? "transpose=1"
+               : (rotate===270) ? "transpose=2"
+               : (rotate===180) ? "transpose=2,transpose=2"
+               : null;
 
-    if(mode!=="copyfix" || !(await exists(outFile))){
-      // 1) metadata
-      const { dispW, dispH, rotate } = await probeMeta(inFile);
-      const pre = (rotate===90) ? "transpose=1"
-                 : (rotate===270) ? "transpose=2"
-                 : (rotate===180) ? "transpose=2,transpose=2"
-                 : null;
+    // 2) multicrop (letter/pillarbox)
+    const cropAuto = await detectCropMulti(inFile, pre);
 
-      // 2) çoklu crop tespiti (pre-rotate ile)
-      const cropAuto = await detectCropMulti(inFile, pre);
+    // 3) efektif boyut (crop varsa ona göre)
+    let effW=dispW, effH=dispH;
+    if(cropAuto){ const m=cropAuto.match(/crop=(\d+):(\d+):/); if(m){ effW=parseInt(m[1],10); effH=parseInt(m[2],10); } }
+    const isPortrait = effH > effW;
 
-      // 3) yön KARARI: crop varsa crop WxH, yoksa görünen WxH
-      let effW = dispW, effH = dispH;
-      if(cropAuto){
-        const m=cropAuto.match(/crop=(\d+):(\d+):/); if(m){ effW=parseInt(m[1],10); effH=parseInt(m[2],10); }
-      }
-      const isPortrait = effH > effW;
+    // 4) hedef AR (parametrik) + hedef genişlik
+    const { tw, th } = parseAR(arParam, isPortrait);
+    const targetW = (H * (tw / th)) * (isPortrait ? 1 : 1); // H sabit, W oranla
+    const cover = vfCoverTo(H, targetW);
 
-      const cover = isPortrait ? vfCover9x16(H) : vfCover16x9(H);
-      const forceAR = isPortrait ? "setdar=9/16,setsar=1/1" : "setdar=16/9,setsar=1/1";
-      const chain = [pre, cropAuto, cover, forceAR].filter(Boolean).join(",");
+    // 5) hafif zoom (overscan) → minik kırpma ile tam oturtma
+    const zoom = overscan > 1.0001 ? `scale=trunc(iw*${overscan}/2)*2:trunc(ih*${overscan}/2)*2` : null;
 
-      await fsp.unlink(outFile).catch(()=>{}); outFile=makeOut();
-      await runEncode(inFile,outFile,chain,preset,maxrate);
-    }
+    const forceAR = `setdar=${tw}/${th},setsar=1/1`;
+    const chain = [pre, cropAuto, zoom, cover, forceAR].filter(Boolean).join(",");
+
+    await fsp.unlink(outFile).catch(()=>{}); outFile=makeOut();
+    await runEncode(inFile,outFile,chain,preset,maxrate);
 
     const buf=await fsp.readFile(outFile); const MAX_INLINE=45*1024*1024;
     if(buf.length<=MAX_INLINE){
@@ -191,7 +203,7 @@ export default async function handler(req,res){
     }
     const blobName=`videos/${Date.now()}-${safe(src)}.mp4`;
     const blob=await blobPut(blobName,buf,{access:"public",addRandomSuffix:true,contentType:"video/mp4"});
-    return ok(res,JSON.stringify({ok:true,size:buf.length,blob_url:blob.url,steps:{autorotate:true,multicrop:!!blobName,final:isPortrait?"9x16":"16x9"}}));
+    return ok(res,JSON.stringify({ok:true,size:buf.length,blob_url:blob.url,final_ar:`${tw}:${th}`,overscan}));
   }catch(err){
     return bad(res,500,err?.message||String(err));
   }finally{
