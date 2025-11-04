@@ -1,0 +1,13 @@
+{
+  "name": "video-convert-vercel",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "20.x" },
+  "dependencies": {
+    "@vercel/blob": "^0.19.0",
+    "busboy": "^1.6.0",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0"
+  }
+}
