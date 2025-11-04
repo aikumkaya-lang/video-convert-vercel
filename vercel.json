@@ -2,9 +2,8 @@
   "version": 2,
   "functions": {
     "api/convert.js": {
-      "memory": 1536,
       "maxDuration": 60,
-      "includeFiles": "node_modules/{ffmpeg-static,ffprobe-static}/**"
+      "includeFiles": "node_modules/{ffmpeg-static/ffmpeg,ffprobe-static/bin/linux/x64/ffprobe}"
     }
   },
   "routes": [
