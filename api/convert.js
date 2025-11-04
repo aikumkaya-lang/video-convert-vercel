@@ -17,11 +17,8 @@ const isHtml = (ct) => typeof ct==="string" && /\btext\/html\b/i.test(ct);
 const rnd = (n=8)=>crypto.randomBytes(n).toString("hex");
 const safeName=(s)=>(s||"video").replace(/[^\w.\-]+/g,"_").replace(/_+/g,"_").slice(0,64);
 
-function driveToDirect(u){
-  if(!u) return "";
-  const s=String(u).trim();
-  const m1=s.match(/\/file\/d\/([A-Za-z0-9_-]{10,})/);
-  const m2=s.match(/[?&]id=([A-Za-z0-9_-]{10,})/);
+function driveToDirect(u){ if(!u) return ""; const s=String(u).trim();
+  const m1=s.match(/\/file\/d\/([A-Za-z0-9_-]{10,})/); const m2=s.match(/[?&]id=([A-Za-z0-9_-]{10,})/);
   const id=(m1?.[1]||m2?.[1]||"").trim();
   return id ? `https://drive.google.com/uc?export=download&id=${id}` : s;
 }
@@ -31,14 +28,12 @@ async function fetchDrive(url, extraHeaders={}){
   const ct=r.headers.get("content-type")||"";
   if(!isHtml(ct)) return r;
   const html=await r.text();
-  const token=
-    html.match(/confirm=([0-9A-Za-z_]+)&/i)?.[1]||
-    html.match(/name="confirm"\s+value="([0-9A-Za-z_]+)"/i)?.[1]||
-    html.match(/download_warning[^"]+"([0-9A-Za-z_]{3,})"/i)?.[1]||"";
+  const token= html.match(/confirm=([0-9A-Za-z_]+)&/i)?.[1]||
+               html.match(/name="confirm"\s+value="([0-9A-Za-z_]+)"/i)?.[1]||
+               html.match(/download_warning[^"]+"([0-9A-Za-z_]{3,})"/i)?.[1]||"";
   const url2= token ? url+(url.includes("?")?"&":"?")+"confirm="+encodeURIComponent(token) : url;
   return fetch(url2,{headers:{cookie,...extraHeaders},redirect:"follow"});
 }
-
 async function getInputFromRequest(req){
   return new Promise((resolve,reject)=>{
     try{
@@ -46,8 +41,7 @@ async function getInputFromRequest(req){
       let url=""; let fileStream=null; let filename="input.bin";
       bb.on("field",(n,v)=>{ if(n==="url") url=String(v||"").trim(); });
       bb.on("file",(_n,stream,info)=>{ filename=info?.filename||filename; fileStream=stream; });
-      bb.on("close",()=>resolve({url,fileStream,filename}));
-      req.pipe(bb);
+      bb.on("close",()=>resolve({url,fileStream,filename})); req.pipe(bb);
     }catch(e){ reject(e); }
   });
 }
@@ -66,9 +60,9 @@ async function urlToTmpFile(urlRaw,hint="in"){
   return { file, disp:r.headers.get("content-disposition")||"" };
 }
 
-// --- ffprobe: etkin W,H (rotate dahil) ---
+// --- ffprobe: etkin W,H (rotate dahil) + SAR ---
 async function probeDims(pth){
-  const args=["-v","error","-select_streams","v:0","-show_entries","stream=width,height,rotation:stream_tags=rotate:side_data_list=rotation","-of","json", pth];
+  const args=["-v","error","-select_streams","v:0","-show_entries","stream=width,height,sample_aspect_ratio,display_aspect_ratio,rotation:stream_tags=rotate:side_data_list=rotation","-of","json", pth];
   return new Promise((resolve,reject)=>{
     let out="", err="";
     const ps=spawn(ffprobeBin.path,args);
@@ -79,27 +73,28 @@ async function probeDims(pth){
       try{
         const j=JSON.parse(out||"{}"); const s=(j.streams||[])[0]||{};
         const w=Number(s.width||0), h=Number(s.height||0);
+        const sar = String(s.sample_aspect_ratio||"1:1");
         let rot=0;
         if(typeof s.rotation==="number") rot=s.rotation;
         else if(s.tags?.rotate) rot=Number(s.tags.rotate)||0;
         else if(Array.isArray(s.side_data_list)){ const sd=s.side_data_list.find(x=>x.rotation!=null); if(sd) rot=Number(sd.rotation)||0; }
         const r=((((rot%360)+360)%360));
         const eff=(r===90||r===270)?{W:h,H:w}:{W:w,H:h};
-        resolve(eff);
+        resolve({ ...eff, sar });
       }catch(e){ reject(e); }
     });
   });
 }
 
-// --- 1-pass Auto-Crop: siyah bar tespiti (stderr'den crop=... çek) ---
-async function detectAutoCrop(inFile){
+// --- turbo cropdetect (hızlı) ---
+async function detectAutoCrop(inFile, frames){
   return new Promise((resolve)=>{
     const args=[
       "-hide_banner","-loglevel","info",
-      "-analyzeduration","50M","-probesize","50M",
+      "-analyzeduration","10M","-probesize","10M",
       "-i", inFile,
       "-vf","cropdetect=24:16:0",
-      "-frames:v","120",
+      "-frames:v", String(frames || 40),
       "-f","null","-"
     ];
     let err=""; const p=spawn(ffmpegPath,args,{stdio:["ignore","ignore","pipe"]});
@@ -121,16 +116,16 @@ const vfCover9x16  = (H)=>{const W=Math.round(H*9/16);  return `scale=trunc(iw*m
 const vfContain    = (H)=>`scale=trunc(iw*min(1\\,${H}/ih)/2)*2:trunc(ih*min(1\\,${H}/ih)/2)*2`;
 
 function ffArgsEncode(inPath,outPath,vf,preset,maxrate){
-  // setsar=1 (DAR sorunlarını bitir), önce optional crop (auto-crop), sonra cover
-  const chain = vf.startsWith("pre:") ? ("setsar=1,"+vf.slice(4)) : ("setsar=1,"+vf);
   return [
     "-hide_banner","-loglevel","error","-y",
-    "-analyzeduration","100M","-probesize","100M",
+    "-analyzeduration","10M","-probesize","10M", // turbo
     "-fflags","+genpts+discardcorrupt","-err_detect","ignore_err",
     "-i", inPath,
+    "-threads","0",
     "-max_muxing_queue_size","9999",
-    "-vf", chain,
-    "-c:v","libx264","-preset",preset,"-crf","23","-maxrate",maxrate,
+    "-vf", vf.startsWith("pre:") ? ("setsar=1,"+vf.slice(4)) : ("setsar=1,"+vf),
+    "-c:v","libx264","-preset", preset, "-crf","23","-maxrate", maxrate,
+    "-tune","zerolatency",
     "-profile:v","baseline","-pix_fmt","yuv420p","-movflags","+faststart",
     "-c:a","aac","-ac","2","-ar","44100","-b:a","128k",
     outPath
@@ -139,7 +134,7 @@ function ffArgsEncode(inPath,outPath,vf,preset,maxrate){
 function ffArgsCopyfix(inPath,outPath){
   return [
     "-hide_banner","-loglevel","error","-y",
-    "-analyzeduration","100M","-probesize","100M",
+    "-analyzeduration","10M","-probesize","10M",
     "-fflags","+genpts+discardcorrupt","-err_detect","ignore_err",
     "-i", inPath,
     "-c:v","copy","-c:a","copy","-movflags","+faststart",
@@ -156,11 +151,12 @@ export default async function handler(req,res){
     if(req.method!=="POST") return bad(res,405,"Only POST");
 
     const u2=new URL(req.url,"http://x");
-    let modeQ = (u2.searchParams.get("mode") || "encode").toLowerCase();
-    const fitQ  = (u2.searchParams.get("fit")  || "cover-auto").toLowerCase();
-    const maxH  = parseInt(u2.searchParams.get("h") || "1080",10);
-    const preset= (u2.searchParams.get("preset") || "faster").toLowerCase();
-    const maxrate=(u2.searchParams.get("maxrate")||"4500k").toLowerCase();
+    const fitQ   = (u2.searchParams.get("fit")  || "cover-auto").toLowerCase();
+    const maxH   = parseInt(u2.searchParams.get("h") || "720",10); // hız için 720 default
+    const maxrate= (u2.searchParams.get("maxrate")||"3500k").toLowerCase(); // biraz düşürdük
+    // turbo: varsayılan; istersen quality için &speed=quality ver
+    const speed  = (u2.searchParams.get("speed") || "turbo").toLowerCase();
+    const preset = speed==="quality" ? (u2.searchParams.get("preset")||"faster") : "ultrafast";
 
     const { url:urlRawForm, fileStream, filename: inName } = await getInputFromRequest(req);
     const urlRaw = urlRawForm || u2.searchParams.get("url") || "";
@@ -176,51 +172,65 @@ export default async function handler(req,res){
       if(m?.[1]) srcName=decodeURIComponent(m[1]);
     }
 
-    // yön bul
+    // yön & SAR
     let orient="landscape";
+    let nearTarget=false;
     try{
       const d=await probeDims(inFile);
-      const T=1.06;
-      if (d.H/Math.max(1,d.W)>=T) orient="portrait";
-      else if (d.W/Math.max(1,d.H)>=T) orient="landscape";
-      else orient="square";
+      const T=1.02; // daha sıkı tolerans (2%)
+      if (d.H/Math.max(1,d.W) >= 16/9 / T) orient="portrait";
+      else if (d.W/Math.max(1,d.H) >= 16/9 / T) orient="landscape";
+      // hedefine zaten çok yakın mı?
+      const ratio = orient==="portrait" ? (d.H/d.W) : (d.W/d.H);
+      const target = 16/9;
+      nearTarget = (ratio > target/T && ratio < target*T) && (d.sar === "1:1" || d.sar === "0:1" || !d.sar);
     }catch{}
 
-    // cover-auto istendiğinde doğruluğu garanti etmek için encode'a zorla
-    if (fitQ === "cover-auto") modeQ = "encode";
-
-    // auto-crop önerisini çıkar (siyah bar varsa)
-    let crop = null;
-    try { crop = await detectAutoCrop(inFile); } catch {}
+    // hızlı cropdetect (40 frame)
+    let crop=null;
+    try{ crop = await detectAutoCrop(inFile, 40); }catch{}
 
     const mkOut=()=>join(tmpdir(),`out_${Date.now()}_${rnd(4)}.mp4`);
     outFile=mkOut();
 
-    // copyfix sadece cover-auto dışı senaryoda kullanılsın (hız)
-    if(modeQ==="copyfix" && fitQ!=="cover-auto"){
-      try{ await run(ffmpegPath, ffArgsCopyfix(inFile,outFile)); }
-      catch{ await fsp.unlink(outFile).catch(()=>{}); outFile=mkOut(); /* encode fallback */ }
+    // === TURBO FAST PATH ===
+    //  - fit=cover-auto
+    //  - nearTarget oran + SAR normal
+    //  - crop tespit edilmedi
+    // -> sadece copyfix (en hızlı yol)
+    if (fitQ==="cover-auto" && nearTarget && !crop){
+      try{
+        await run(ffmpegPath, ffArgsCopyfix(inFile,outFile));
+        const buf=await fsp.readFile(outFile);
+        if(buf.length <= 45*1024*1024){
+          res.statusCode=200;
+          res.setHeader("Content-Type","video/mp4");
+          res.setHeader("Content-Disposition",`inline; filename="${safeName(srcName)}.mp4"`);
+          return res.end(buf);
+        } else {
+          const blobName=`videos/${Date.now()}-${safeName(srcName)}.mp4`;
+          const blob=await blobPut(blobName,buf,{access:"public",addRandomSuffix:true,contentType:"video/mp4"});
+          return ok(res,JSON.stringify({ok:true,modeUsed:"copyfix",fitUsed:fitQ,fastPath:true,blob_url:blob.url}));
+        }
+      }catch{/* encode'a düş */}
     }
 
-    if(modeQ!=="copyfix" || !(await fileExists(outFile))){
-      const targetVf = (() => {
-        if (fitQ!=="cover-auto") return vfContain(maxH);
-        if (orient==="portrait")  return vfCover9x16(maxH);
-        if (orient==="landscape") return vfCover16x9(maxH);
-        return vfContain(maxH);
-      })();
+    // === Encode yolu (tek geçiş) ===
+    const targetVf = (() => {
+      if (fitQ!=="cover-auto") return vfContain(maxH);
+      return orient==="portrait" ? vfCover9x16(maxH)
+           : orient==="landscape" ? vfCover16x9(maxH)
+           : vfContain(maxH);
+    })();
 
-      // pre:crop + cover zinciri
-      let vfChain = targetVf;
-      if (crop && crop.w > 0 && crop.h > 0) {
-        const pre = `pre:crop=${crop.w}:${crop.h}:${crop.x}:${crop.y},${targetVf}`;
-        vfChain = pre;
-      }
-
-      const tryEncode = async (vf)=>{ await fsp.unlink(outFile).catch(()=>{}); outFile=mkOut(); await run(ffmpegPath, ffArgsEncode(inFile,outFile,vf,preset,maxrate)); };
-      try{ await tryEncode(vfChain); }
-      catch{ await tryEncode("setsar=1,"+vfContain(maxH)); }
+    let vfChain = targetVf;
+    if (crop && crop.w>0 && crop.h>0) {
+      vfChain = `pre:crop=${crop.w}:${crop.h}:${crop.x}:${crop.y},${targetVf}`;
     }
+
+    const tryEncode = async (vf)=>{ await fsp.unlink(outFile).catch(()=>{}); outFile=mkOut(); await run(ffmpegPath, ffArgsEncode(inFile,outFile,vf,preset,maxrate)); };
+    try{ await tryEncode(vfChain); }
+    catch{ await tryEncode("setsar=1,"+vfContain(maxH)); }
 
     const buf=await fsp.readFile(outFile);
     const MAX_INLINE=45*1024*1024;
@@ -232,7 +242,7 @@ export default async function handler(req,res){
     }
     const blobName=`videos/${Date.now()}-${safeName(srcName)}.mp4`;
     const blob=await blobPut(blobName,buf,{access:"public",addRandomSuffix:true,contentType:"video/mp4"});
-    return ok(res,JSON.stringify({ok:true,modeUsed:modeQ,fitUsed:fitQ,orientation:orient,size:buf.length,blob_url:blob.url}));
+    return ok(res,JSON.stringify({ok:true,modeUsed:"encode",fitUsed:fitQ,fastPath:false,blob_url:blob.url}));
   }catch(err){
     return bad(res,500,err?.message||String(err));
   }finally{
